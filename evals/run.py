@@ -4,6 +4,7 @@
     python -m evals.run --answers                # also generate answers (extractive or your LLM)
     python -m evals.run --answers --judge        # plus an LLM-as-judge faithfulness check
     python -m evals.run --sweep                  # pick the abstention threshold
+    python -m evals.run --answers --fresh        # regenerate instead of reusing cached answers
     python -m evals.run --min-hit5 0.85          # exit 1 if the primary config falls below this
 
 Questions come in three types:
@@ -15,6 +16,7 @@ Questions come in three types:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -25,12 +27,14 @@ from typing import Any
 
 from citewise.config import get_settings
 from citewise.generation.guardrails import CITATION, SENTENCE_WITH_CITES, support_ratio
+from citewise.generation.llm import LLMError
 from citewise.runtime import Runtime
 
 from .metrics import dedupe, hit_at, key_fact_recall, mean, ndcg_at, p50, percentile, reciprocal_rank
 
 DATASET = Path(__file__).parent / "datasets" / "handbook_qa.jsonl"
 REPORTS = Path(__file__).parent / "reports"
+ANSWER_CACHE = REPORTS / "answers-cache.jsonl"
 ABSTAIN_TYPES = {"unanswerable", "restricted"}
 
 
@@ -149,44 +153,143 @@ def judge(rt: Runtime, question: str, answer: dict[str, Any]) -> dict[str, Any] 
         raw = rt.llm.complete(msg, max_tokens=200, temperature=0).text
         start, end = raw.find("{"), raw.rfind("}")
         return json.loads(raw[start : end + 1])
-    except Exception as e:  # a judge failure shouldn't sink the whole run
+    except LLMError as e:
+        if e.retryable:  # rate limit or outage: stop the run so it can resume later
+            raise
+        return {"error": str(e)[:200]}
+    except Exception as e:  # an unparseable verdict shouldn't sink the whole run
         return {"error": str(e)[:200]}
 
 
-def eval_answers(rt: Runtime, rows: list[dict[str, Any]], use_judge: bool) -> dict[str, Any]:
-    results = []
-    for i, row in enumerate(rows, 1):
-        principal = rt.access.principals[row["as"]]
-        ans = rt.answerer.answer(row["question"], row["workspace"], principal).model_dump()
-        rec: dict[str, Any] = {
-            "id": row["id"],
-            "type": row["type"],
-            "question": row["question"],
-            "abstained": ans["abstained"],
-            "abstain_reason": ans["abstain_reason"],
-            "text": ans["text"],
-            "ms": ans["timings_ms"].get("total", 0.0),
-            "invalid_citations": ans["invalid_citations"],
+class AnswersIncomplete(Exception):
+    """The LLM gave up partway (usually a provider's rate limit). Finished questions are cached."""
+
+
+def answers_fingerprint(rt: Runtime) -> str:
+    """Everything that changes an answer. Cached answers are reused only when this matches."""
+    s = rt.settings
+    parts = {
+        "llm": "extractive" if rt.llm is None else f"{s.llm_provider}:{rt.llm.model}",
+        "temperature": s.llm_temperature,
+        "max_tokens": s.llm_max_tokens,
+        "embedding": s.embedding_model,
+        "reranker": s.reranker_model,
+        "mode": s.retrieval_mode,
+        "candidates": s.candidates,
+        "top_k": s.top_k,
+        "rrf_k": s.rrf_k,
+        "abstain": [s.abstain_min_rerank, s.abstain_min_dense],
+        "chunks": [s.chunk_max_words, s.chunk_min_words],
+    }
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _cache_key(fingerprint: str, row: dict[str, Any]) -> str:
+    q = hashlib.sha256(f"{row['workspace']}|{row['as']}|{row['question']}".encode()).hexdigest()[:12]
+    return f"{fingerprint}:{row['id']}:{q}"
+
+
+def load_answer_cache(path: Path) -> dict[str, dict[str, Any]]:
+    cache: dict[str, dict[str, Any]] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                entry = json.loads(line)
+                cache[entry["key"]] = entry["rec"]  # later lines win (a judge verdict added on resume)
+            except (json.JSONDecodeError, KeyError):
+                continue  # a line cut off by Ctrl+C
+    return cache
+
+
+def answer_one(rt: Runtime, row: dict[str, Any]) -> dict[str, Any]:
+    principal = rt.access.principals[row["as"]]
+    ans = rt.answerer.answer(row["question"], row["workspace"], principal).model_dump()
+    rec: dict[str, Any] = {
+        "id": row["id"],
+        "type": row["type"],
+        "question": row["question"],
+        "abstained": ans["abstained"],
+        "abstain_reason": ans["abstain_reason"],
+        "text": ans["text"],
+        "ms": ans["timings_ms"].get("total", 0.0),
+        "tokens": (ans.get("usage") or {}).get("total_tokens", 0),
+        "invalid_citations": ans["invalid_citations"],
+    }
+    if row["type"] == "answerable" and not ans["abstained"]:
+        by_n = {s["n"]: s for s in ans["sources"]}
+        cited_paths = {
+            by_n[n]["chunk_id"].split(":", 1)[1].rsplit("#", 1)[0] for n in ans["cited"] if n in by_n
         }
-        if row["type"] == "answerable" and not ans["abstained"]:
-            by_n = {s["n"]: s for s in ans["sources"]}
-            cited_paths = {
-                by_n[n]["chunk_id"].split(":", 1)[1].rsplit("#", 1)[0] for n in ans["cited"] if n in by_n
-            }
-            rec["cited_gold"] = bool(cited_paths & set(row["gold_docs"]))
-            rec["key_facts"] = key_fact_recall(ans["text"], row.get("must_include", []))
-            rec["grounded"] = ans["grounded"]
-            ratios = []
-            for sentence in SENTENCE_WITH_CITES.findall(ans["text"]):
-                nums = [int(n) for m in CITATION.finditer(sentence) for n in m.group(1).split(",")]
-                texts = " ".join(by_n[n]["text"] for n in nums if n in by_n)
-                if texts:
-                    ratios.append(support_ratio(sentence, texts))
-            rec["support"] = mean(ratios) if ratios else None
-            if use_judge:
-                rec["judge"] = judge(rt, row["question"], ans)
-        results.append(rec)
-        print(f"  answers {i}/{len(rows)}", end="\r", file=sys.stderr)
+        rec["cited_gold"] = bool(cited_paths & set(row["gold_docs"]))
+        rec["key_facts"] = key_fact_recall(ans["text"], row.get("must_include", []))
+        rec["grounded"] = ans["grounded"]
+        ratios = []
+        for sentence in SENTENCE_WITH_CITES.findall(ans["text"]):
+            nums = [int(n) for m in CITATION.finditer(sentence) for n in m.group(1).split(",")]
+            texts = " ".join(by_n[n]["text"] for n in nums if n in by_n)
+            if texts:
+                ratios.append(support_ratio(sentence, texts))
+        rec["support"] = mean(ratios) if ratios else None
+        # Kept so the judge can run later (on a resumed run) without regenerating the answer.
+        rec["cited_sources"] = [by_n[n] for n in ans["cited"] if n in by_n]
+    return rec
+
+
+def eval_answers(
+    rt: Runtime, rows: list[dict[str, Any]], use_judge: bool, cache_path: Path | None = ANSWER_CACHE
+) -> dict[str, Any]:
+    """Answers every question. Each finished question is appended to `cache_path` straight away,
+    so a run stopped by a rate limit (or Ctrl+C) picks up where it left off when re-run."""
+    fingerprint = answers_fingerprint(rt)
+    cache = load_answer_cache(cache_path) if cache_path else {}
+    results, reused = [], 0
+    out = cache_path.open("a") if cache_path else None
+    try:
+        for i, row in enumerate(rows, 1):
+            key = _cache_key(fingerprint, row)
+            rec = cache.get(key)
+            changed = False
+            try:
+                if rec is None:
+                    rec, changed = answer_one(rt, row), True
+                else:
+                    reused += 1
+                needs_judge = (
+                    use_judge
+                    and rec["type"] == "answerable"
+                    and not rec["abstained"]
+                    and not isinstance(rec.get("judge"), dict)
+                )
+                if needs_judge:
+                    rec["judge"] = judge(
+                        rt,
+                        row["question"],
+                        {
+                            "sources": rec.get("cited_sources", []),
+                            "cited": [s["n"] for s in rec.get("cited_sources", [])],
+                            "text": rec["text"],
+                        },
+                    )
+                    changed = True
+            except LLMError as e:
+                if not e.retryable:
+                    raise
+                if out and changed and rec is not None:
+                    out.write(json.dumps({"key": key, "rec": rec}) + "\n")
+                raise AnswersIncomplete(
+                    f"stopped at question {i} of {len(rows)}: {e}\n"
+                    f"{i - 1} finished questions are saved. Run the same command again later "
+                    "(after the provider's limit resets) and it continues from here."
+                ) from e
+            if out and changed:
+                out.write(json.dumps({"key": key, "rec": rec}) + "\n")
+                out.flush()
+            results.append(rec)
+            note = f" ({reused} from cache)" if reused else ""
+            print(f"  answers {i}/{len(rows)}{note}", end="\r", file=sys.stderr)
+    finally:
+        if out:
+            out.close()
     print(file=sys.stderr)
 
     ans_rows = [r for r in results if r["type"] == "answerable"]
@@ -208,6 +311,7 @@ def eval_answers(rt: Runtime, rows: list[dict[str, Any]], use_judge: bool) -> di
         "abstention_rate": mean([float(r["abstained"]) for r in abstain_rows]),
         "p50_ms": p50([r["ms"] for r in results]),
         "p95_ms": percentile([r["ms"] for r in results], 0.95),
+        "llm_tokens": sum(r.get("tokens") or 0 for r in results),
     }
     if judged:
         summary["judge_supported"] = mean([float(bool(j.get("supported"))) for j in judged])
@@ -241,8 +345,11 @@ def sweep(rt: Runtime, rows: list[dict[str, Any]]) -> dict[str, Any]:
         kept = sum(v >= t for v in ans) / len(ans) if ans else 0.0
         blocked = sum(v < t for v in abst) / len(abst) if abst else 0.0
         table.append({"threshold": t, "answerable_kept": kept, "should_abstain_blocked": blocked})
+    # Block as many should-abstain questions as possible while keeping 95% of answerable ones.
+    # With only 18 refusal questions, neighbouring thresholds often tie; ties go to the stricter
+    # one, since it is the one that also catches junk the eval set doesn't contain.
     ok = [r for r in table if r["answerable_kept"] >= 0.95]
-    best = max(ok, key=lambda r: (r["should_abstain_blocked"], -r["threshold"])) if ok else None
+    best = max(ok, key=lambda r: (r["should_abstain_blocked"], r["threshold"])) if ok else None
     return {"signal": signal, "table": table, "recommended": best}
 
 
@@ -304,6 +411,8 @@ def write_report(
             f"| Correct abstentions (unanswerable + restricted) | {pct(a['abstention_rate'])} of {a['should_abstain']} |",
             f"| Latency p50 / p95 | {a['p50_ms']:.0f} / {a['p95_ms']:.0f} ms |",
         ]
+        if a.get("llm_tokens"):
+            lines.append(f"| LLM tokens (answers only) | {a['llm_tokens']:,} |")
         if "judge_supported" in a:
             lines.append(f"| Judge: every claim supported | {pct(a['judge_supported'])} |")
             lines.append(f"| Judge: answers the question | {pct(a['judge_answers_question'])} |")
@@ -360,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--answers", action="store_true", help="also generate and score answers")
     ap.add_argument("--judge", action="store_true", help="LLM-as-judge faithfulness check (needs an LLM)")
     ap.add_argument("--sweep", action="store_true", help="abstention threshold sweep")
+    ap.add_argument("--fresh", action="store_true", help="ignore answers cached by an earlier run")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--min-hit5", type=float, help="fail if the primary config's Hit@5 is below this")
     ap.add_argument("--min-mrr", type=float, help="fail if the primary config's MRR@10 is below this")
@@ -376,7 +486,15 @@ def main(argv: list[str] | None = None) -> int:
         s = eval_retrieval(rt, rows, cfg)
         retrieval.append(s)
         print(f"  {cfg.name:<16} hit@5 {pct(s.hit5):>6}  mrr {s.mrr10:.3f}  leaks {s.leaks}", file=sys.stderr)
-    answers = eval_answers(rt, rows, args.judge) if args.answers else None
+    answers = None
+    if args.answers:
+        if args.fresh:
+            ANSWER_CACHE.unlink(missing_ok=True)
+        try:
+            answers = eval_answers(rt, rows, args.judge)
+        except AnswersIncomplete as e:
+            print(f"\nANSWERS INCOMPLETE: {e}", file=sys.stderr)
+            return 2
     sw = sweep(rt, rows) if args.sweep else None
     path = write_report(rt, retrieval, answers, sw, len(rows))
     print(path.read_text())

@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # Abstain before calling the LLM when the best source is this weak. Chosen with
     # `python -m evals.run --sweep` (see README). 0 disables the gate.
-    abstain_min_rerank: float = 0.02  # sigmoid of the cross-encoder logit
+    abstain_min_rerank: float = 0.01  # sigmoid of the cross-encoder logit
     abstain_min_dense: float = 0.0  # cosine similarity, used only when there is no reranker
 
     chunk_max_words: int = 220

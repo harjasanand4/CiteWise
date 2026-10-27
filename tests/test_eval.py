@@ -59,3 +59,80 @@ def test_dataset_covers_every_slice():
     assert types.count("unanswerable") >= 10
     assert types.count("restricted") >= 5
     assert sum("paraphrase" in r.get("tags", []) for r in rows()) >= 10
+
+
+class _StubAnswer:
+    def __init__(self, question: str) -> None:
+        self.question = question
+
+    def model_dump(self) -> dict:
+        return {
+            "abstained": True,
+            "abstain_reason": "model_not_found",
+            "text": "not in the handbook",
+            "timings_ms": {"total": 5.0},
+            "usage": {"total_tokens": 100},
+            "invalid_citations": [],
+            "sources": [],
+            "cited": [],
+            "grounded": False,
+        }
+
+
+def _stub_runtime(fail_once_on: set[str], calls: list[str], **settings):
+    from types import SimpleNamespace
+
+    from citewise.config import Settings
+    from citewise.generation.llm import LLMError
+
+    class StubAnswerer:
+        mode = "stub-llm"
+
+        def answer(self, question, workspace, principal):
+            calls.append(question)
+            if question in fail_once_on:
+                fail_once_on.discard(question)
+                raise LLMError("LLM API error 429: rate limit reached", 429, retryable=True)
+            return _StubAnswer(question)
+
+    return SimpleNamespace(
+        settings=Settings(_env_file=None, **settings),
+        llm=SimpleNamespace(model="stub-llm"),
+        access=SimpleNamespace(principals={"ana": None}),
+        answerer=StubAnswerer(),
+    )
+
+
+def test_answers_run_resumes_after_a_rate_limit(tmp_path: Path):
+    import pytest
+
+    from evals.run import AnswersIncomplete, eval_answers
+
+    cache = tmp_path / "answers-cache.jsonl"
+    data = [
+        {
+            "id": f"q{i}",
+            "type": "unanswerable",
+            "workspace": "acme",
+            "as": "ana",
+            "question": f"question {i}?",
+        }
+        for i in range(3)
+    ]
+    calls: list[str] = []
+    rt = _stub_runtime({"question 1?"}, calls)
+
+    with pytest.raises(AnswersIncomplete, match="1 finished questions are saved"):
+        eval_answers(rt, data, use_judge=False, cache_path=cache)
+    assert calls == ["question 0?", "question 1?"]
+
+    cache.write_text(cache.read_text() + '{"key": "cut off by Ctrl+')  # a half-written line is skipped
+    result = eval_answers(rt, data, use_judge=False, cache_path=cache)
+    assert calls[2:] == ["question 1?", "question 2?"]  # question 0 came from the cache
+    assert result["summary"]["abstention_rate"] == 1.0 and len(result["results"]) == 3
+    assert result["summary"]["llm_tokens"] == 300
+
+    # A setting that changes answers (here the abstention threshold) invalidates the cache.
+    calls.clear()
+    eval_answers(_stub_runtime(set(), calls, abstain_min_rerank=0.5), data, use_judge=False, cache_path=cache)
+    assert calls == ["question 0?", "question 1?", "question 2?"]

@@ -44,9 +44,9 @@ The eval set is **122 hand-labeled questions** over both handbooks (`evals/datas
 | Keyword only (SQLite FTS5 BM25) | 74.0% | 92.3% | 0.824 | 68.8% | 0 |
 | Vector only, static embeddings (WordLlama 256-d) | 64.4% | 82.7% | 0.715 | 75.0% | 0 |
 | Hybrid: BM25 + WordLlama | 76.0% | 95.2% | 0.840 | 81.2% | 0 |
-| Vector only (bge-small-en-v1.5) | _run it_ | _run it_ | _run it_ | _run it_ | |
-| Hybrid: BM25 + bge-small | _run it_ | _run it_ | _run it_ | _run it_ | |
-| **Hybrid + rerank (default)** | _run it_ | _run it_ | _run it_ | _run it_ | |
+| Vector only (bge-small-en-v1.5) | 82.7% | 96.2% | 0.890 | 93.8% | 0 |
+| Hybrid: BM25 + bge-small | 85.6% | 98.1% | 0.913 | 93.8% | 0 |
+| **Hybrid + rerank (default)** | **86.5%** | **99.0%** | **0.925** | **93.8%** | **0** |
 
 **Answers:**
 
@@ -55,12 +55,14 @@ The eval set is **122 hand-labeled questions** over both handbooks (`evals/datas
 | Extractive, no LLM | 68.3% | 61.8% | 90.1% | 11 / 18 |
 | Groq `openai/gpt-oss-120b` | _run it_ | _run it_ | _run it_ | _run it_ |
 
-Fill in the `_run it_` rows with `make eval` (downloads about 200 MB of models once) and `make eval-answers` (needs an LLM key, see below; on a free tier it's slow, since rate-limit responses are waited out and retried). The full report, including every miss, is written to `evals/reports/latest.md`.
+Reproduce the retrieval table with `make eval` (downloads about 200 MB of models once) and the answers table with `make eval-answers` (needs an LLM key, see below). Each finished question is saved as it completes, so a run that hits a free tier's daily limit picks up where it stopped when you run it again. The full report, including every miss, is written to `evals/reports/latest.md`.
 
-**What the eval shows so far:**
+**What the eval shows:**
 
-- **Keyword search is a strong baseline until people stop using the handbook's words.** It finds 96.6% of pages when the question reuses the page's wording, but only 68.8% when it's paraphrased. Even weak static embeddings do better there (75.0%), and hybrid gets the best of both (81.2% paraphrased, 95.2% overall). That gap is the case for hybrid search.
-- **Similarity scores are a poor "should I refuse?" signal.** With static embeddings, any threshold that keeps 95% of answerable questions only blocks 11% of the ones that should be refused (`--sweep`). That's why the abstention gate uses the cross-encoder's score, and why the model has its own `NOT_FOUND` path as a second layer.
+- **Keyword search is a strong baseline until people stop using the handbook's words.** It finds 96.6% of pages when the question reuses the page's wording, but only 68.8% when it's paraphrased. A small embedding model closes most of that gap (93.8% on paraphrases), and fusing the two gives the best overall result: 98.1% Hit@5 before reranking, 99.0% after, and every answerable question's page in the top 10.
+- **The reranker buys a little accuracy for a lot of latency.** It lifts Hit@1 from 85.6% to 86.5% and MRR from 0.913 to 0.925, but scoring 30 candidates with a cross-encoder on a MacBook Air CPU takes search from 15 ms to 1.2 s (p50; p95 2.3 s). It stays on by default because the abstention gate uses its score, and next to an LLM call a second is affordable. `CITEWISE_RERANKER_MODEL=none` turns it off.
+- **Retrieval scores alone can't decide when to refuse.** Even with the cross-encoder, the strictest threshold that still keeps 95% of answerable questions (0.01, the default) only blocks 5 of the 18 questions that should be refused. Going stricter starts losing real answers: 0.02 blocks 6 of 18 but drops 6.7% of answerable questions. With static embeddings the same rule blocked only 11%. So the gate is a cheap first filter, and the model's `NOT_FOUND` path is the layer that has to catch the rest.
+- **The one page outside the top 5** is "The app is down for customers right now. What's the first thing I should do?", where the SDK guidelines outrank the incident-response page. The question describes the situation without ever saying "incident".
 - **The eval needed testing too.** Reading the misses turned up a question whose answer is on two pages, and only one had been labeled. The label was fixed, and `tests/test_eval.py` now checks the dataset against the access rules (a "restricted" question's page must really be unreadable to the asker).
 
 ## Quick start
@@ -68,24 +70,32 @@ Fill in the `_run it_` rows with `make eval` (downloads about 200 MB of models o
 Needs Python 3.11+ and Node 20.19+.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
+citewise fetch
+citewise ingest
+pytest
+```
 
-citewise fetch          # both handbooks at pinned commits (sparse git checkout, about 15 MB)
-citewise ingest         # parse, chunk, embed, index. Re-runs only touch changed pages
-pytest                  # 94 tests (the Postgres half runs when TEST_DATABASE_URL is set)
+`fetch` downloads both handbooks at pinned commits (a sparse git checkout, about 15 MB). `ingest` parses, chunks, embeds and indexes them, and re-running it only touches pages that changed. `pytest` runs the test suite; the Postgres half runs when `TEST_DATABASE_URL` is set. On Windows, activate with `.venv\Scripts\activate`.
 
+Then build the UI and start the server, and open http://localhost:8000:
+
+```bash
 cd web && npm install && npm run build && cd ..
-citewise serve          # http://localhost:8000
+citewise serve
 ```
 
 From the terminal:
 
 ```bash
 citewise ask "How long do I have to upload a receipt?" -w posthog --as alex
-citewise search "jury duty" -w tts --as jordan       # retrieval only, with each retriever's rank
+citewise search "jury duty" -w tts --as jordan
 ```
+
+`search` runs retrieval only and shows each retriever's rank for every hit.
 
 The UI has a **Viewing as** switch. Ask "How much is the referral bonus?" as Alex (engineer), then as Sam (hiring manager): the hiring pages only exist for Sam.
 
@@ -93,8 +103,8 @@ The UI has a **Viewing as** switch. Ask "How much is the referral bonus?" as Ale
 
 Without one, Citewise runs in **extractive mode**: it quotes the best-matching sentences, with citations. For written answers:
 
-```bash
-# in .env — Groq has a free tier
+```dotenv
+# in .env (Groq has a free tier)
 CITEWISE_LLM_PROVIDER=groq
 CITEWISE_LLM_API_KEY=gsk_...
 CITEWISE_LLM_MODEL=openai/gpt-oss-120b
@@ -112,18 +122,19 @@ Any OpenAI-compatible API works (`CITEWISE_LLM_PROVIDER=openai_compatible` plus 
 docker compose up -d --build
 docker compose run --rm api sh -c "citewise fetch && citewise ingest"
 open http://localhost:8000
-
-docker compose --profile observability up -d   # adds Prometheus on :9090
 ```
+
+`docker compose --profile observability up -d` adds Prometheus on :9090.
 
 ## Evaluation
 
-```bash
-python -m evals.run                         # every retriever configuration, per-slice
-python -m evals.run --sweep                 # pick the abstention threshold
-python -m evals.run --answers --judge       # generate answers, plus an LLM-as-judge faithfulness check
-make ablation                               # same eval with WordLlama embeddings in a separate index (Python 3.11-3.13)
-```
+| Command | What it does |
+|---|---|
+| `python -m evals.run` | Retrieval metrics for every retriever configuration, per slice |
+| `python -m evals.run --sweep` | Abstention threshold sweep (`make eval` runs both) |
+| `python -m evals.run --answers --judge` | Generates answers and scores them, plus an LLM-as-judge faithfulness check |
+| `python -m evals.run --answers --fresh` | Regenerates every answer instead of reusing the ones saved by an earlier run |
+| `make ablation` | The same eval with WordLlama static embeddings in a separate index (Python 3.11 to 3.13) |
 
 | Metric | Meaning |
 |---|---|
