@@ -1,0 +1,38 @@
+# Each workspace is one knowledge base, pinned to an exact commit so the index and the
+# labeled eval set always describe the same text. Bump `commit` deliberately, then re-run
+# the eval to see what changed.
+workspaces:
+  posthog:
+    name: PostHog Handbook
+    description: How PostHog (product analytics company, ~300 people, all-remote) runs itself.
+    repo: https://github.com/PostHog/posthog.com
+    commit: cbd5ce0edcbf265c9bd7f0732edc8586dd5debb2
+    path: contents/handbook
+    license: MIT (the /contents folder of posthog.com)
+    url:
+      base: https://posthog.com/handbook
+    include: ["**/*.md", "**/*.mdx"]
+    exclude: ["**/_snippets/**"]  # partials that are also rendered inside other pages
+    examples:
+      - How much can I put on my company card each month?
+      - When do expense receipts need to be uploaded?
+      - Which days of the week are meeting-free?
+      - How do I declare an incident?
+
+  tts:
+    name: TTS Handbook (GSA)
+    description: The Technology Transformation Services handbook, U.S. General Services Administration.
+    repo: https://github.com/18F/handbook
+    commit: c220f93896b39e9e4ab0f486a1d5bf346ac06e3e
+    path: pages
+    license: CC0 1.0 (U.S. government work, public domain)
+    url:
+      base: https://handbook.tts.gsa.gov
+      trailing_slash: true
+    include: ["**/*.md"]
+    exclude: ["redirects/**"]
+    examples:
+      - What leave can I use for jury duty?
+      - How do I get reimbursed after a work trip?
+      - I'm taking a personal trip abroad. Do I need to tell anyone?
+      - When is my Tock timecard due each week?

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local data: corpora are fetched at pinned commits, indexes are rebuilt
+data/*
+!data/.gitkeep
+
+# Eval output (CI uploads it as an artifact)
+evals/reports/*
+!evals/reports/.gitkeep
+
+# Web
+web/node_modules/
+web/dist/
+
+# Secrets
+.env
+
+.DS_Store
+web/*.tsbuildinfo

@@ -1,0 +1,45 @@
+# Who can read what.
+#
+# Rules map document paths to the groups allowed to read them. The first matching rule
+# wins; a document with no matching rule is readable by every member of its workspace.
+# Both handbooks are public in real life, so these restrictions are simulated, but the
+# mechanism is the real one: the ACL is stored on every chunk and applied inside the
+# search query, before anything is ranked or sent to the model.
+rules:
+  posthog:
+    - match: "exec/**"
+      groups: [exec]
+    - match: "people/hiring-process/**"
+      groups: [people-team, hiring-managers]
+  tts:
+    - match: "supervisor-resources/**"
+      groups: [supervisors]
+
+# Demo principals. The keys below are for local development only; in production the
+# principal and its groups come from your identity provider (OIDC claims or SCIM groups).
+principals:
+  alex:
+    name: Alex · PostHog product engineer
+    api_key: demo-alex
+    workspaces: [posthog]
+    groups: [engineering]
+  sam:
+    name: Sam · PostHog engineering manager
+    api_key: demo-sam
+    workspaces: [posthog]
+    groups: [engineering, hiring-managers]
+  jordan:
+    name: Jordan · TTS designer
+    api_key: demo-jordan
+    workspaces: [tts]
+    groups: []
+  riley:
+    name: Riley · TTS supervisor
+    api_key: demo-riley
+    workspaces: [tts]
+    groups: [supervisors]
+  admin:
+    name: Admin · both workspaces, every group
+    api_key: demo-admin
+    workspaces: [posthog, tts]
+    groups: [exec, people-team, hiring-managers, supervisors]

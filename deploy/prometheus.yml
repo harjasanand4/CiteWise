@@ -1,0 +1,8 @@
+# Scrapes the API's /metrics endpoint. See docs/operations.md for useful queries.
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: citewise
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
